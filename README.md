@@ -4,7 +4,7 @@
 
 **Author:** Bharat Kumar
 **Stack:** FastAPI · PostgreSQL · Redis · Celery · React (Vite, PWA) · S3-compatible storage · Local SLM (Ollama)
-**Status:** Active build. Foundation and identity layers are implemented; academic modules are in progress (see [Build Status](#11-build-status)).
+**Status:** Active build. Foundation and identity layers are implemented; academic modules are in progress (see [Build Status](#12-build-status)).
 
 ---
 
@@ -51,8 +51,6 @@ flowchart TB
         W2["Worker: notifications"]
         W3["Worker: imports"]
         W4["Worker: ai<br/>nightly flags"]
-        BEAT --> W1
-        BEAT --> W4
     end
 
     subgraph AI["AI Zone (isolated network, no internet)"]
@@ -61,8 +59,10 @@ flowchart TB
         TOOLS["Tool Layer<br/>whitelisted read-only"]
         LLM["Local SLM<br/>inference server, no DB access"]
         GW --> ORCH
+        ML["ML Service<br/>scoring only, trained models"]
         ORCH --> LLM
         ORCH --> TOOLS
+        ORCH --> ML
     end
 
     subgraph Data["Data Layer"]
@@ -89,6 +89,7 @@ flowchart TB
     SVC --> RD
     SVC --> OBJ
     SVC -- "enqueue jobs" --> RD
+    BEAT -- "schedules tasks" --> RD
     RD -- "broker" --> W1
     RD -- "broker" --> W2
     RD -- "broker" --> W3
@@ -104,7 +105,7 @@ flowchart TB
 **Why this shape**
 
 - **Layered backend** (router, service, repository): business rules live in one place, so a rule like "only the subject teacher can edit marks" can't be bypassed by a new endpoint.
-- **Redis + Celery from day one**: emails, notifications and bulk imports never block a request. Sized for roughly 250 to 2000 students per institution.
+- **Redis + Celery from day one**: emails, notifications and bulk imports never block a request. Sized for roughly 250 to 2000 students per institution. Celery Beat only schedules: it drops tasks onto the Redis queue and the workers pick them up from there.
 - **PostgreSQL as the only source of truth**: Redis is used for speed and safety (rate limits, revocation), never as the only copy of important data.
 - **On-premise, isolated AI**: the language model runs on the school's own server inside a separate network zone with no internet access and no database credentials. No student data is ever sent to an outside AI service (see [section 9](#9-ai-student-performance-assistant)).
 
@@ -243,20 +244,23 @@ Design decision: attendance comes **only** from the punch machine. There is no m
 stateDiagram-v2
     [*] --> Draft: Subject teacher uploads marks
     Draft --> Draft: Edit (subject teacher only)
-    Draft --> Submitted: Teacher submits
-    Submitted --> Published: Headmaster / Principal publishes
-    Published --> Closed: Result closed
-    Closed --> ChangeRequested: Correction needed
-    ChangeRequested --> Closed: Rejected
-    ChangeRequested --> Published: Director / Principal approves
-    Published --> [*]
+    Draft --> Submitted: Subject teacher submits
+    Submitted --> Submitted: Typo fix inside correction window, subject teacher or class teacher, logged
+    Submitted --> Published: Headmaster or Principal publishes
+    Published --> Closed: Headmaster closes the result cycle
+    Closed --> [*]
+    Published --> ChangeRequested: Correction requested
+    Closed --> ChangeRequested: Correction requested
+    ChangeRequested --> Published: Decision on a published result, new version saved
+    ChangeRequested --> Closed: Decision on a closed result, new version saved
 ```
 
 **Rules**
 
-- Only the **subject teacher of that class and subject** can upload or edit marks.
-- A class teacher can fix upload mistakes only inside a short time window.
-- After result publication, every change needs approval from higher management, and every change is audit-logged with old and new values.
+- Only the **subject teacher of that class and subject** can upload and edit marks while they are a draft.
+- After the teacher submits, a short **correction window** opens (length set per institution). Inside it, the subject teacher **or the class teacher** can fix upload mistakes such as typos or swapped columns. Every fix is logged with old and new values.
+- Once the window closes, or after publication, any change needs a **change request**. The Director or Principal approves or rejects it. An approved change creates a new version of the mark and the old version stays in the history.
+- **Published** means students and parents can see the result. **Closed** means the result cycle is over; the Headmaster closes it by hand. Closed is the final state, and any later correction goes through a change request.
 - Students never see monitoring analytics; they see only their published results.
 
 ---
@@ -272,23 +276,34 @@ flowchart TD
     TK["Student / Parent raises ticket"] --> CAT{"Category"}
     CAT -->|"Technical issue"| OPS["LMS Operator"]
     CAT -->|"Class related"| CLT["Class Teacher"]
-    CAT -->|"Teacher complaint"| PRIN["Principal"]
-    CAT -->|"Safety concern"| SAFE["Principal + Director"]
+    CAT -->|"Teacher complaint"| CC{"Conflict check:<br/>who is named<br/>in the ticket?"}
+    CAT -->|"Safety concern"| CC
+    CC -->|"Nobody in management"| NORM["Complaint: Principal<br/>Safety: Principal + Director"]
+    CC -->|"Principal named"| DIR["Director only"]
+    CC -->|"Director named"| BOARD["Governing board contact<br/>outside the admin hierarchy"]
+    CC -->|"Principal and Director named"| BOARD
 
     OPS --> RES["Resolve + status updates<br/>to the reporter"]
     CLT --> RES
-    PRIN --> RES
-    SAFE --> RES
+    NORM --> RES
+    DIR --> RES
+    BOARD --> RES
     RES --> AUD["Audit log"]
 ```
 
-**Privacy rule:** ticket identity is stored for accountability, but the accused teacher only ever sees an anonymous ID. Safety tickets never route to the people they concern.
+**Routing and privacy rules**
+
+- **Conflict check on every complaint and safety ticket:** anyone named in the ticket is removed from its recipients and can never open it. The ticket moves to the next level up: a complaint about the Principal goes to the Director only, and a ticket naming the Director (or both) goes to a governing board contact configured per institution, outside the normal admin hierarchy.
+- The LMS Operator and Headmaster cannot read the content of complaint or safety tickets; they see only technical status.
+- Ticket identity is stored for accountability, but a teacher who is complained about only ever sees an anonymous ID.
+- Feedback is shown to a teacher only after a minimum number of responses exist, so a single student cannot be identified.
+- Tickets can be raised by a student **or a parent**; the raiser is recorded as a profile (see section 11).
 
 ---
 
 ## 9. AI student performance assistant
 
-**Goal:** a teacher enters a student's **name, roll number, class and section**, then asks questions in plain language, for example *"Show Rahul's marks in all subjects"* or *"Has his attendance dropped this term?"*. Nobody has to track students by hand. A small local language model (SLM) understands the question and explains the result; the **database does all the calculation**, and the **existing security model decides what is allowed**.
+**Goal:** a teacher enters a student's **name, roll number, class and section**, then asks questions in plain language, for example *"Show Rahul's marks in all subjects"* (any teacher, for the subjects they teach) or *"Has his attendance dropped this term?"* (class teachers and management). Nobody has to track students by hand. A small local language model (SLM) understands the question and explains the result; the **database does all the calculation**, and the **existing security model decides what is allowed**.
 
 **Core idea:** the AI is not a new system bolted on the side. It is one more client of the same backend rules. It has no powers of its own: whatever the logged-in teacher may see, it may fetch, and nothing more.
 
@@ -321,7 +336,7 @@ flowchart LR
 | Existing component | What the AI feature reuses it for |
 |---|---|
 | JWT sessions and per-request role reload (section 4) | The AI never trusts a token alone; a suspended teacher loses AI access immediately |
-| Teaching assignments (section 10) | Defines each teacher's scope: which class, section and subject they may query |
+| Teaching assignments (section 11) | Defines each teacher's scope: which class, section and subject they may query |
 | Marks workflow (section 7) | AI reads only **published or closed** marks, so a draft is never exposed |
 | Access logs and audit logs | Every student profile opened through chat is logged exactly like a manual view |
 | Redis | Per-user rate limits, daily quota, short result cache |
@@ -387,13 +402,22 @@ The model cannot do anything outside this list. It cannot write SQL, call the in
 
 | Tool | Returns | Who can use it | Scope enforced |
 |---|---|---|---|
-| `find_student` | Matching students for name, roll no, class, section | Teacher, Admin | Own classes only (admin: all) |
-| `get_marks` | Marks for one student, chosen subjects and exam types | Teacher, Admin | Subject teacher: own subject. Class teacher: all subjects of own class |
-| `compare_exams` | Class Test, Half-Yearly, Viva, Yearly side by side | Teacher, Admin | Same as above |
-| `get_trend` | Term-over-term change per subject | Teacher, Admin | Same as above |
-| `compare_with_class` | Student vs class average and rank band | Class Teacher, Admin | Own class only |
-| `get_attendance_summary` | Present, late, absent counts and pattern | Class Teacher, Admin | Own class only |
-| `list_flags` | Advisory flags for a student or class | Class Teacher, Admin | Own class only |
+| `find_student` | Matching students for name, roll no, class, section | Teacher, Management | Own classes only (management: all) |
+| `get_marks` | Marks for one student, chosen subjects and exam types | Teacher, Management | Subject teacher: own subject. Class teacher: all subjects of own class |
+| `compare_exams` | Class Test, Half-Yearly, Viva, Yearly side by side | Teacher, Management | Same as above |
+| `get_trend` | Term-over-term change per subject | Teacher, Management | Same as above |
+| `compare_with_class` | Student vs class average and rank band | Class Teacher, Management | Own class only |
+| `get_attendance_summary` | Present, late, absent counts and pattern | Class Teacher, Management | Own class only |
+| `list_flags` | Advisory flags for a student or class | Class Teacher, Management | Own class only |
+
+**Who can ask what**
+
+| Role | Marks, exam comparison, trends | Student vs class average | Attendance and flags |
+|---|---|---|---|
+| Subject teacher | Own subject, own classes | No | No |
+| Class teacher | All subjects of own class and section | Yes, own class | Yes, own class |
+| Management (Director, Principal, Headmaster) | All classes | Yes | Yes |
+| LMS Operator | No (technical role, no student analytics) | No | No |
 
 Students and parents do **not** get this assistant. They see only their own published results.
 
@@ -408,7 +432,7 @@ All exam types for all subjects appear together, so a teacher does not open sepa
 | English | 15 / 25 | 58 / 100 | 7 / 10 | 60 / 100 | Stable |
 | Hindi | 21 / 25 | 78 / 100 | 9 / 10 | 80 / 100 | Improving |
 
-Views: one student across all subjects, one subject across exam types, student vs class average, and term-over-term trend charts. This screen works **without the AI** (a plain filter form uses the same tools), so the chat is a convenience and never a single point of failure.
+Views: one student across subjects (a subject teacher sees only their own subject, a class teacher sees all subjects of their class), one subject across exam types, term-over-term trend charts, and student vs class average (class teacher and management only). This screen works **without the AI** (a plain filter form uses the same tools), so the chat is a convenience and never a single point of failure.
 
 ### 9.5 Automatic behaviour and performance signals
 
@@ -416,7 +440,9 @@ Views: one student across all subjects, one subject across exam types, student v
 
 ```mermaid
 flowchart LR
-    BEAT["Celery Beat<br/>nightly"] --> RE
+    BEAT["Celery Beat<br/>nightly schedule"] --> Q[("Redis queue")]
+    Q --> WK["Celery worker: ai"]
+    WK --> RE
     ATT["Attendance records"] --> RE
     MRK["Published marks"] --> RE
     NOTE["Teacher notes<br/>optional, short"] --> RE
@@ -504,7 +530,136 @@ Building the data and rules first means the AI is only a thin, replaceable layer
 
 ---
 
-## 10. Data model (high level)
+## 10. AI/ML capability map
+
+This platform is designed AI/ML-first: wherever a task is repetitive, pattern-based or text-heavy, a model should do the groundwork and a human should make the decision. Section 9 covers the teacher-facing assistant. This section lists **every other place** where AI/ML fits, and the rules that keep it safe.
+
+### 10.1 Design principles for AI/ML here
+
+1. **Rules first, ML when data exists.** A school has hundreds, not millions, of students. Models stay switched off until enough history exists; fixed rules cover the gap.
+2. **Simple, explainable models.** Logistic regression, gradient boosting, regression and clustering beat deep learning on small data and can show the reasons behind every score.
+3. **AI advises, people decide.** Nothing a model produces changes a mark, a ticket status or a student record without a human action.
+4. **Everything runs locally.** Training and scoring happen on the school's own server. No student data leaves it.
+5. **Language models write, they do not calculate.** Numbers always come from the database or a scored model, never from free text generation.
+
+### 10.2 Use-case map
+
+```mermaid
+flowchart LR
+    DATA[("School data<br/>marks, attendance,<br/>feedback, tickets, notes")]
+
+    subgraph ACAD["Academic insight"]
+        A1["Early-warning risk score"]
+        A2["Marks forecast and trend"]
+        A3["Weak-topic detection"]
+        A4["Class pattern groups"]
+    end
+    subgraph OPS["Operations and data quality"]
+        O1["Marks-entry anomaly checks"]
+        O2["Duplicate student detection"]
+        O3["Punch-machine anomaly checks"]
+    end
+    subgraph COMM["Communication"]
+        C1["Report-card remark drafts"]
+        C2["Parent notice drafts<br/>Hindi and English"]
+        C3["Policy and FAQ assistant"]
+    end
+    subgraph FBT["Feedback and tickets"]
+        F1["Feedback theme analysis"]
+        F2["Ticket classification<br/>and priority"]
+        F3["Duplicate ticket grouping"]
+    end
+    subgraph SEC["Security"]
+        S1["Unusual access detection"]
+        S2["Login abuse detection"]
+        S3["PII redaction before model"]
+    end
+
+    DATA --> ACAD
+    DATA --> OPS
+    DATA --> COMM
+    DATA --> FBT
+    DATA --> SEC
+```
+
+### 10.3 Use cases by readiness
+
+**Tier 1: works from day one (little or no history needed)**
+
+| Use case | What it does | Technique | Human step |
+|---|---|---|---|
+| Report-card remarks | Drafts a short remark per student from verified marks, attendance and trend | Local SLM with templates | Teacher edits and approves |
+| Parent notices and translation | Drafts circulars, reminders and progress summaries in simple Hindi or English | Local SLM or translation model | Admin approves before sending |
+| Policy and FAQ assistant | Answers parents' questions on fees, timetable and rules from school documents | RAG over public school documents only, no student data | Hands over to the office when unsure |
+| Ticket classification and priority | Suggests category and urgency, spots safety wording | Small text classifier or SLM | AI may only **raise** priority, never lower it; a human confirms routing |
+| Marks-entry anomaly checks | Catches marks above the maximum, swapped columns, sudden class-wide jumps | Statistical rules and outlier detection | Teacher confirms before submitting |
+| Duplicate student detection | Spots the same child registered twice, or sibling mismatches | Fuzzy matching on name, date of birth, parent contact | Operator decides |
+| Unusual access detection | Flags a user opening far more student profiles than normal, or at odd hours | Per-user baseline and anomaly detection on access logs | Alert goes to Principal and Director |
+| PII redaction | Removes names and phone numbers from free text before any model sees it | Pattern rules plus a small entity-recognition model | Automatic, logged |
+
+**Tier 2: after one full term of real data**
+
+| Use case | What it does | Technique | Human step |
+|---|---|---|---|
+| Early-warning risk score | Estimates which students may need support before the next exam | Logistic regression or gradient boosting | Teacher sees the top reasons and acknowledges or dismisses |
+| Marks forecast | Gives an expected range for the next exam | Simple regression or time-series smoothing | Shown as a range, never as a grade |
+| Attendance patterns | Finds repeated weekday absences, late-arrival trends and faulty punch devices | Time-series analysis and clustering | Class teacher or operator |
+| Feedback theme analysis | Summarises topics and sentiment in feedback per teacher, anonymised | Topic modelling and SLM summaries, minimum response count | Management sees trends; teachers see aggregates only |
+| Duplicate ticket grouping | Links repeated complaints about the same issue | Text embeddings and similarity | Principal or operator |
+
+**Tier 3: needs richer data**
+
+| Use case | What it does | Technique | Human step |
+|---|---|---|---|
+| Weak-topic detection | Shows which chapters a student or class struggles with | Item analysis; needs chapter-wise or question-wise marks | Teacher plans remedial work |
+| Class pattern groups | Groups students as steady, improving or fluctuating, for class planning | Clustering | Planning view only; no labels shown on a child |
+| Teacher-support insights | Compares class progress with expected progress instead of raw marks | Regression on prior performance | Management only, used for support and never for ranking |
+| Revision suggestions | Suggests chapters to revise before exams | Rules over weak topics, SLM wording | Teacher approves before sharing |
+| Timetable optimisation | Builds a clash-free timetable | Constraint solver (not ML) | Admin reviews |
+
+### 10.4 Model lifecycle
+
+```mermaid
+flowchart LR
+    DB[("PostgreSQL<br/>read-only views")] --> SNAP["De-identified snapshot<br/>pseudonyms, no contacts"]
+    SNAP --> FEAT["Feature builder<br/>no protected attributes"]
+    FEAT --> TRAIN["Offline training job<br/>on the school server"]
+    TRAIN --> EVAL{"Quality and fairness<br/>checks passed?"}
+    EVAL -->|"No"| STOP["Model stays switched off<br/>rules only"]
+    EVAL -->|"Yes"| REG["Model registry<br/>version + checksum"]
+    REG --> SERVE["ML Service<br/>scoring only"]
+    SERVE --> SC["Nightly scoring<br/>Celery worker: ai"]
+    SC --> FLG[("student_flags<br/>with top reasons")]
+    FLG --> HUM["Teacher acknowledges<br/>or dismisses"]
+    HUM -->|"feedback for retraining"| SNAP
+    SC --> MON["Monitoring<br/>drift and error rates"]
+    MON -->|"quality drops"| STOP
+```
+
+### 10.5 Responsible-AI rules
+
+| Rule | Why |
+|---|---|
+| No protected attributes (gender, religion, caste, family income, disability) as model inputs | Prevents unfair scoring |
+| Fairness check across sections and groups before a model is enabled | A model that works worse for one group is not released |
+| Every score shows its top reasons | Teachers can judge it instead of trusting it blindly |
+| Minimum data before enabling (at least one full term, and a minimum number of students) | Avoids confident predictions from too little data |
+| Thresholds set by management and logged | Sensitivity is a school decision |
+| Advisory only, no labels like "weak" or "problem student" | Protects children from being labelled |
+| Parent-facing text is always approved by a human | Prevents wrong or tone-deaf messages |
+| Models are versioned, checksum-verified and monitored for drift | A silent quality drop switches the model off |
+| Children's data handled under consent and purpose limits | Compliance with applicable data-protection law (to be confirmed with legal advice) |
+
+### 10.6 Delivery order
+
+1. **Phases 3 to 6:** exam data, rules, flags and the Tier 1 drafting and checking tools.
+2. **Phase 7:** isolated model zone, assistant (section 9) and Tier 1 language features.
+3. **After the first full term in production:** Tier 2 models, enabled only after the quality and fairness checks.
+4. **Later:** Tier 3, once richer data (chapter-wise marks) is being collected.
+
+---
+
+## 11. Data model (high level)
 
 ```mermaid
 erDiagram
@@ -521,6 +676,7 @@ erDiagram
     SUBJECT ||--o{ TEACHING_ASSIGNMENT : "for"
     STUDENT ||--o{ ATTENDANCE : "punches"
     STUDENT ||--o{ MARK : "scores"
+    SUBJECT ||--o{ MARK : "graded in"
     EXAM ||--o{ MARK : "contains"
     EXAM {
         string exam_type "class_test, half_yearly, yearly, viva"
@@ -534,9 +690,14 @@ erDiagram
     STUDENT_FLAG ||--o{ FLAG_ACTION : "handled by"
     STUDENT ||--o{ FEEDBACK : "gives"
     TEACHER ||--o{ FEEDBACK : "receives"
-    STUDENT ||--o{ TICKET : "raises"
+    PROFILE ||--o{ TICKET : "raises"
+    STUDENT ||--o{ TICKET : "concerns"
+    TICKET ||--o{ TICKET_PARTY : "names"
+    PROFILE ||--o{ TICKET_PARTY : "named as"
     PROFILE ||--o{ AUDIT_LOG : "acts"
 ```
+
+Every mark belongs to exactly one student, one exam and one subject. A ticket is raised by a profile (student or parent) and keeps a list of named parties for the conflict check in section 8.
 
 Cross-cutting tables: `audit_logs` (append-only, enforced by database triggers so even application bugs can't rewrite history), `access_logs` (who viewed which student profile, partitioned by time) and `ai_query_logs` (which question was asked about which student, by whom, using which tool). The AI zone reads data only through dedicated read-only database **views**, never directly from the main tables.
 
@@ -544,7 +705,7 @@ Cross-cutting tables: `audit_logs` (append-only, enforced by database triggers s
 
 ---
 
-## 11. Build status
+## 12. Build status
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -554,8 +715,8 @@ Cross-cutting tables: `audit_logs` (append-only, enforced by database triggers s
 | 3 | Attendance, exams (class test, half-yearly, yearly, viva), marks, result publishing, grading schemes | Planned |
 | 4 | Student monitoring dashboards, one-screen multi-exam marks comparison, rule engine and stored student flags (no AI needed) | Planned |
 | 5 | Feedback and tickets | Planned |
-| 6 | Reports and notifications (email, push, WhatsApp) | Planned |
-| 7 | AI assistant on top of verified tools: isolated local SLM, orchestrator, policy engine, read-only DB views, chat UI, plain-words flag explanations | Planned |
+| 6 | Reports and notifications (email, push, WhatsApp), AI-drafted report remarks and notices (teacher approved) | Planned |
+| 7 | AI/ML layer (sections 9 and 10): isolated local SLM, assistant, policy engine, read-only DB views, ML models for early warning, forecasting and anomalies | Planned |
 | 8 | Security hardening, load and penetration testing, including AI red-team tests | Planned |
 | 9 | Integration, release candidate, deployment | Planned |
 
@@ -563,7 +724,7 @@ The platform has about 140 tracked tasks in total, delivered phase by phase.
 
 ---
 
-## 12. Engineering process
+## 13. Engineering process
 
 ```mermaid
 flowchart LR
@@ -584,7 +745,7 @@ flowchart LR
 
 ---
 
-## 13. Design principles
+## 14. Design principles
 
 1. **Security by default:** deny by default, re-check on every request, log everything sensitive.
 2. **Simple for users, strict in the backend:** the UI is minimal; the rules are enforced server-side.
@@ -594,6 +755,7 @@ flowchart LR
 6. **AI explains, the database calculates:** the language model understands questions and writes summaries; every number comes from a validated query, and every AI action is logged.
 7. **The AI has no privileges of its own:** it inherits the logged-in user's scope, runs in an isolated zone, and can only call a fixed list of read-only tools.
 8. **Deterministic first, AI on top:** tables, rules and flags work without the model, so the AI is a replaceable layer rather than a dependency.
+9. **Rules first, ML when data exists:** models are enabled only after enough history and passing quality and fairness checks, and they only advise.
 
 ---
 
